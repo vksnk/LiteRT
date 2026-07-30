@@ -239,6 +239,9 @@ class YNNPackDelegateKernel : public SimpleDelegateKernelInterface {
                  node.builtin_code == kTfLiteBuiltinMean) {
         TF_LITE_ENSURE_STATUS(
             DefineReductionNode(context, subgraph_, tensor_to_value_id_, node));
+      } else if (node.builtin_code == kTfLiteBuiltinSelectV2) {
+        TF_LITE_ENSURE_STATUS(
+            DefineSelectNode(context, subgraph_, tensor_to_value_id_, node));
       } else if (node.builtin_code == kTfLiteBuiltinStablehloClamp) {
         TF_LITE_ENSURE_STATUS(DefineStablehloClampNode(
             context, subgraph_, tensor_to_value_id_, node));
@@ -494,6 +497,8 @@ class YNNPackDelegate : public SimpleDelegateInterface {
                builtin_code == kTfLiteBuiltinReduceMax ||
                builtin_code == kTfLiteBuiltinMean) {
       return IsReductionSupported(registration, node, context) == kTfLiteOk;
+    } else if (builtin_code == kTfLiteBuiltinSelectV2) {
+      return IsSelectSupported(registration, node, context) == kTfLiteOk;
     } else if (builtin_code == kTfLiteBuiltinStablehloClamp) {
       return IsStablehloClampSupported(registration, node, context) ==
              kTfLiteOk;

@@ -50,6 +50,14 @@ TfLiteStatus DefineStablehloClampNode(TfLiteContext* context,
                                       TensorToValueIdMap& tensor_to_value_id,
                                       const NodeInfo& node);
 
+// Select
+TfLiteStatus IsSelectSupported(const TfLiteRegistration* registration,
+                               const TfLiteNode* node, TfLiteContext* context);
+
+TfLiteStatus DefineSelectNode(TfLiteContext* context, ynn_subgraph_t subgraph,
+                              TensorToValueIdMap& tensor_to_value_id,
+                              const NodeInfo& node);
+
 // Quantize/Dequantize operations
 TfLiteStatus IsQuantizeSupported(const TfLiteRegistration* registration,
                                  const TfLiteNode* node,

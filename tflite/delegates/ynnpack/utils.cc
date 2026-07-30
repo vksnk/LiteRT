@@ -100,6 +100,11 @@ ynn_type GetYnnType(TfLiteType type) {
       return ynn_type_uint4;
     case kTfLiteInt2:
       return ynn_type_int2;
+    case kTfLiteBool:
+      // TFLite stores one bool per byte, and YNNPACK represents booleans as a
+      // uint8 that is 0 or 1 (what the comparison operators produce and what
+      // `ynn_define_select` consumes), so the buffers are compatible.
+      return ynn_type_uint8;
     default:
       return ynn_type_invalid;
   }
@@ -181,6 +186,22 @@ ynn_binary_operator GetYnnBinaryOperator(int builtin_code) {
       return ynn_binary_squared_difference;
     case kTfLiteBuiltinPrelu:
       return ynn_binary_leaky_relu;
+    case kTfLiteBuiltinEqual:
+      return ynn_binary_equal;
+    case kTfLiteBuiltinNotEqual:
+      return ynn_binary_not_equal;
+    case kTfLiteBuiltinLess:
+      return ynn_binary_less;
+    case kTfLiteBuiltinLessEqual:
+      return ynn_binary_less_equal;
+    case kTfLiteBuiltinGreater:
+      return ynn_binary_greater;
+    case kTfLiteBuiltinGreaterEqual:
+      return ynn_binary_greater_equal;
+    case kTfLiteBuiltinLogicalAnd:
+      return ynn_binary_logical_and;
+    case kTfLiteBuiltinLogicalOr:
+      return ynn_binary_logical_or;
     default:
       return ynn_binary_invalid;
   }

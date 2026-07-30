@@ -16,6 +16,7 @@ limitations under the License.
 #include "tflite/delegates/ynnpack/elementwise.h"
 
 #include <cstdint>
+#include <numeric>
 #include <vector>
 
 #include "ynnpack/composites/composites.h"  // from @XNNPACK
@@ -24,6 +25,7 @@ limitations under the License.
 #include "tflite/core/c/builtin_op_data.h"
 #include "tflite/core/c/common.h"
 #include "tflite/delegates/ynnpack/utils.h"
+#include "tflite/kernels/kernel_util.h"
 
 namespace tflite {
 namespace ynnpack {
@@ -393,6 +395,93 @@ TfLiteStatus DefineStablehloClampNode(TfLiteContext* context,
                                    output_val_id));
   }
 
+  return kTfLiteOk;
+}
+
+// ==============================================================================
+// Select
+// ==============================================================================
+
+TfLiteStatus IsSelectSupported(const TfLiteRegistration* registration,
+                               const TfLiteNode* node, TfLiteContext* context) {
+  TF_LITE_ENSURE_EQ(context, node->inputs->size, 3);
+  TF_LITE_ENSURE_EQ(context, node->outputs->size, 1);
+
+  const TfLiteTensor& condition = context->tensors[node->inputs->data[0]];
+  const TfLiteTensor& input_true = context->tensors[node->inputs->data[1]];
+  const TfLiteTensor& input_false = context->tensors[node->inputs->data[2]];
+  const TfLiteTensor& output = context->tensors[node->outputs->data[0]];
+
+  TF_LITE_ENSURE(context, IsTensorSupported(condition));
+  TF_LITE_ENSURE(context, IsTensorSupported(input_true));
+  TF_LITE_ENSURE(context, IsTensorSupported(input_false));
+  TF_LITE_ENSURE(context, IsTensorSupported(output));
+
+  TF_LITE_ENSURE_EQ(context, condition.type, kTfLiteBool);
+  TF_LITE_ENSURE_EQ(context, input_true.type, output.type);
+  TF_LITE_ENSURE_EQ(context, input_false.type, output.type);
+
+  // Only the types YNNPACK has select kernels for.
+  const ynn_type value_type = GetYnnType(output.type);
+  TF_LITE_ENSURE(context,
+                 value_type == ynn_type_fp32 || value_type == ynn_type_int32);
+
+  // A quantized select would need its operands requantized to a common scale.
+  TF_LITE_ENSURE(context, !IsQuantized(output));
+
+  // YNNPACK inserts leading broadcast dimensions for lower rank inputs and
+  // treats extent 1 dimensions as broadcasts, so operands that are scalars (or
+  // already the shape of the output) need no explicit broadcasting. Anything
+  // else would need `broadcast_like`, which with dynamic shapes turns every
+  // extent into a `select` on the runtime extent; re-evaluating those bounds
+  // per invoke costs far more than the select saves (measured: 5x slower
+  // decode), so leave those to TFLite.
+  auto broadcasts_for_free = [&](const TfLiteTensor& t) {
+    return tflite::NumElements(&t) == 1 || TfLiteIntArrayEqual(t.dims, output.dims);
+  };
+  // Taking a select into YNNPACK also pulls it into a partition whose bounds
+  // are re-evaluated on every invoke. For the large masks of a prefill that is
+  // a big win, but for the one-token mask of a decode step the per-invoke cost
+  // dominates (measured: 5x slower decode), so only take the large ones.
+  constexpr int kMinElements = 64 * 1024;
+  TF_LITE_ENSURE(context, tflite::NumElements(&output) >= kMinElements);
+
+  TF_LITE_ENSURE(context, broadcasts_for_free(condition));
+  TF_LITE_ENSURE(context, broadcasts_for_free(input_true));
+  TF_LITE_ENSURE(context, broadcasts_for_free(input_false));
+
+  return kTfLiteOk;
+}
+
+TfLiteStatus DefineSelectNode(TfLiteContext* context, ynn_subgraph_t subgraph,
+                              TensorToValueIdMap& tensor_to_value_id,
+                              const NodeInfo& node) {
+  TF_LITE_ENSURE_EQ(context, node.inputs.size(), 3);
+  TF_LITE_ENSURE_EQ(context, node.outputs.size(), 1);
+
+  const int condition_tensor_index = node.inputs[0];
+  const int true_tensor_index = node.inputs[1];
+  const int false_tensor_index = node.inputs[2];
+  const int output_tensor_index = node.outputs[0];
+
+  uint32_t condition_val_id = GetOrCreateValueId(
+      context, subgraph, tensor_to_value_id, condition_tensor_index);
+  uint32_t true_val_id = GetOrCreateValueId(context, subgraph,
+                                            tensor_to_value_id,
+                                            true_tensor_index);
+  uint32_t false_val_id = GetOrCreateValueId(
+      context, subgraph, tensor_to_value_id, false_tensor_index);
+  uint32_t output_val_id = GetOrCreateValueId(
+      context, subgraph, tensor_to_value_id, output_tensor_index);
+
+  TF_LITE_ENSURE(context, condition_val_id != YNN_INVALID_VALUE_ID);
+  TF_LITE_ENSURE(context, true_val_id != YNN_INVALID_VALUE_ID);
+  TF_LITE_ENSURE(context, false_val_id != YNN_INVALID_VALUE_ID);
+  TF_LITE_ENSURE(context, output_val_id != YNN_INVALID_VALUE_ID);
+
+  TF_LITE_ENSURE_YNN_STATUS(ynn_define_select(subgraph, condition_val_id,
+                                              true_val_id, false_val_id,
+                                              &output_val_id, /*flags=*/0));
   return kTfLiteOk;
 }
 
