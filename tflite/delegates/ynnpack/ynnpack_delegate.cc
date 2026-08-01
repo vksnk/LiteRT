@@ -257,11 +257,19 @@ class YNNPackDelegateKernel : public SimpleDelegateKernelInterface {
       }
     }
 
+    return kTfLiteOk;
+  }
+
+  // Compiles the subgraph defined above into a runtime. This is by far the
+  // most expensive part of getting a partition ready -- it runs Slinky's
+  // pipeline construction -- and, unlike defining the subgraph, it reads
+  // nothing from the `TfLiteContext`, so it can be deferred out of `Init`.
+  // (`context` is only used for error reporting.)
+  TfLiteStatus CreateRuntime(TfLiteContext* context) {
     ynn_threadpool_t ynn_tp = reinterpret_cast<ynn_threadpool_t>(thread_pool_);
     TF_LITE_ENSURE_YNN_STATUS(ynn_optimize_subgraph(subgraph_, ynn_tp, 0));
     TF_LITE_ENSURE_YNN_STATUS(
         ynn_create_runtime(subgraph_, ynn_tp, 0, &runtime_));
-
     return kTfLiteOk;
   }
 
@@ -294,12 +302,23 @@ class YNNPackDelegateKernel : public SimpleDelegateKernelInterface {
       nodes_info_.push_back(node_info);
     }
 
-    return BuildSubgraphAndRuntime(context);
+    // Define the subgraph now -- this needs the `TfLiteContext`, which is only
+    // usable for reading the graph while the delegate is being applied -- but
+    // do not compile it. TFLite calls `Init` for every delegated partition of
+    // every subgraph in the model, while only the partitions reachable from the
+    // signature being run are ever prepared and invoked; on gemma-4-E2B-it that
+    // is 151 of 2140. Compiling here would run Slinky's pipeline construction
+    // for ~1900 partitions that never execute. Defining the subgraph is cheap
+    // by comparison (0.11 s for all of them, against 5.9 s to compile them).
+    TF_LITE_ENSURE_STATUS(BuildSubgraphAndRuntime(context));
+    return kTfLiteOk;
   }
 
   TfLiteStatus Prepare(TfLiteContext* context, TfLiteNode* node) override {
-    bool rebuild_required = false;
-    for (size_t i = 0; i < input_tensor_indices_.size(); ++i) {
+    // Not compiled yet: this is the first time this partition will run.
+    bool rebuild_required = runtime_ == nullptr;
+    for (size_t i = 0; !rebuild_required && i < input_tensor_indices_.size();
+         ++i) {
       const TfLiteTensor& tensor = context->tensors[input_tensor_indices_[i]];
       if (options_.static_shape) {
         if (tensor.dims->size != input_shapes_[i].size() ||
@@ -318,7 +337,12 @@ class YNNPackDelegateKernel : public SimpleDelegateKernelInterface {
     }
 
     if (rebuild_required) {
-      TF_LITE_ENSURE_STATUS(BuildSubgraphAndRuntime(context));
+      if (runtime_ != nullptr) {
+        // A shape change: the subgraph bakes in the extents it was defined
+        // with, so it has to be defined again before being recompiled.
+        TF_LITE_ENSURE_STATUS(BuildSubgraphAndRuntime(context));
+      }
+      TF_LITE_ENSURE_STATUS(CreateRuntime(context));
     }
 
     // Set input shapes in YNNPACK.
