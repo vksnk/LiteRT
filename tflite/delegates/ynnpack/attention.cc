@@ -249,6 +249,7 @@ TfLiteStatus DefineSdpaNode(TfLiteContext* context, ynn_subgraph_t subgraph,
   uint32_t current_k_val_id = k_val_id;
   uint32_t current_v_val_id = v_val_id;
   uint32_t current_mask_val_id = mask_val_id;
+  bool defer_v_slice = false;
 
   if (sdpa_inputs.param_index != -1) {
     // Slice K
@@ -269,46 +270,39 @@ TfLiteStatus DefineSdpaNode(TfLiteContext* context, ynn_subgraph_t subgraph,
         dummy_val_id_k, &sliced_k_val_id, /*flags=*/0));
     current_k_val_id = sliced_k_val_id;
 
-    // Slice V
-    const TfLiteTensor& v_tensor = context->tensors[sdpa_inputs.v_index];
-    size_t full_dims_v[YNN_MAX_TENSOR_RANK];
-    for (int i = 0; i < v_tensor.dims->size; ++i) {
-      full_dims_v[i] = v_tensor.dims->data[i];
-    }
-    uint32_t dummy_val_id_v = YNN_INVALID_VALUE_ID;
-    TF_LITE_ENSURE_STATUS(GetOrCreateDummyInput(
-        context, subgraph, next_external_id, dummy_inputs,
-        sdpa_inputs.param_index, v_seq_axis, v_tensor.dims->size, full_dims_v,
-        GetYnnType(v_tensor.type), &dummy_val_id_v));
-
-    uint32_t sliced_v_val_id = YNN_INVALID_VALUE_ID;
-    int32_t slice_axes_v[1] = {v_seq_axis};
-    TF_LITE_ENSURE_YNN_STATUS(ynn_define_slice_like(
-        subgraph, /*num_axes=*/1, slice_axes_v, current_v_val_id,
-        dummy_val_id_v, &sliced_v_val_id, /*flags=*/0));
-    current_v_val_id = sliced_v_val_id;
-
-    if (mask_val_id != YNN_INVALID_VALUE_ID) {
-      const TfLiteTensor& mask_tensor =
-          context->tensors[sdpa_inputs.mask_index];
-      size_t full_dims_mask[YNN_MAX_TENSOR_RANK];
-      for (int i = 0; i < mask_tensor.dims->size; ++i) {
-        full_dims_mask[i] = mask_tensor.dims->data[i];
+    // Slice V. When V's seq axis coincides with K's (seq-major layout), the
+    // dummy is shared with K's and the two slices get the same symbolic
+    // extent. Otherwise (transposed layout) defer the slice: it is done
+    // against the attention scores once they exist, so that it reuses K's
+    // symbolic extent instead of introducing a second dummy whose extent
+    // slinky cannot relate to K's, even though they are always equal at
+    // runtime -- unrelatable extents leave unfoldable single-iteration
+    // loops in the pipeline.
+    if (v_seq_axis == k_seq_axis) {
+      const TfLiteTensor& v_tensor = context->tensors[sdpa_inputs.v_index];
+      size_t full_dims_v[YNN_MAX_TENSOR_RANK];
+      for (int i = 0; i < v_tensor.dims->size; ++i) {
+        full_dims_v[i] = v_tensor.dims->data[i];
       }
-      int mask_seq_axis = mask_tensor.dims->size - 1;
-      uint32_t dummy_val_id_mask = YNN_INVALID_VALUE_ID;
+      uint32_t dummy_val_id_v = YNN_INVALID_VALUE_ID;
       TF_LITE_ENSURE_STATUS(GetOrCreateDummyInput(
           context, subgraph, next_external_id, dummy_inputs,
-          sdpa_inputs.param_index, mask_seq_axis, mask_tensor.dims->size,
-          full_dims_mask, GetYnnType(mask_tensor.type), &dummy_val_id_mask));
+          sdpa_inputs.param_index, v_seq_axis, v_tensor.dims->size,
+          full_dims_v, GetYnnType(v_tensor.type), &dummy_val_id_v));
 
-      uint32_t sliced_mask_val_id = YNN_INVALID_VALUE_ID;
-      int32_t slice_axes_mask[1] = {mask_seq_axis};
+      uint32_t sliced_v_val_id = YNN_INVALID_VALUE_ID;
+      int32_t slice_axes_v[1] = {v_seq_axis};
       TF_LITE_ENSURE_YNN_STATUS(ynn_define_slice_like(
-          subgraph, /*num_axes=*/1, slice_axes_mask, current_mask_val_id,
-          dummy_val_id_mask, &sliced_mask_val_id, /*flags=*/0));
-      current_mask_val_id = sliced_mask_val_id;
+          subgraph, /*num_axes=*/1, slice_axes_v, current_v_val_id,
+          dummy_val_id_v, &sliced_v_val_id, /*flags=*/0));
+      current_v_val_id = sliced_v_val_id;
+    } else {
+      defer_v_slice = true;
     }
+
+    // The mask is not sliced here either: it is sliced against the attention
+    // scores right before it is added to them (see below), for the same
+    // reason as the deferred V slice.
   }
 
   uint32_t mask_val_to_add_id = current_mask_val_id;
@@ -366,9 +360,13 @@ TfLiteStatus DefineSdpaNode(TfLiteContext* context, ynn_subgraph_t subgraph,
     k_trans_id = current_k_val_id;
 
     // V is transposed [B, H, D, S], we need to transpose it to [B, H, S, D].
-    const int32_t v_perm[] = {0, 1, 3, 2};
-    TF_LITE_ENSURE_YNN_STATUS(ynn_define_static_transpose(
-        subgraph, 4, v_perm, current_v_val_id, &v_trans_id, 0));
+    // With a deferred V slice this happens later, after V is sliced against
+    // the attention scores.
+    if (!defer_v_slice) {
+      const int32_t v_perm[] = {0, 1, 3, 2};
+      TF_LITE_ENSURE_YNN_STATUS(ynn_define_static_transpose(
+          subgraph, 4, v_perm, current_v_val_id, &v_trans_id, 0));
+    }
   }
 
   uint32_t scale_const_id = YNN_INVALID_VALUE_ID;
@@ -432,8 +430,28 @@ TfLiteStatus DefineSdpaNode(TfLiteContext* context, ynn_subgraph_t subgraph,
 
     uint32_t masked_logits_id = YNN_INVALID_VALUE_ID;
     if (mask_val_to_add_id != YNN_INVALID_VALUE_ID) {
+      uint32_t mask_to_add_id = mask_val_to_add_id;
+      if (sdpa_inputs.param_index != -1) {
+        // Slice the mask along its kv-seq (last) axis using the scores as
+        // the template: the last axis of both maps to the same (innermost)
+        // slinky dim regardless of rank, and the scores' extent there is the
+        // K/V slice's symbolic extent. Reusing that expression (rather than
+        // a separate shape-carrier dummy, whose extent slinky could not
+        // relate to the K/V one) lets loop bounds and steps derived from the
+        // two compare equal at pipeline build time. The elementwise mask
+        // preprocessing above still only computes the consumed region:
+        // bounds are inferred from consumers.
+        const TfLiteTensor& mask_tensor =
+            context->tensors[sdpa_inputs.mask_index];
+        int32_t mask_seq_axis = mask_tensor.dims->size - 1;
+        uint32_t sliced_mask_id = YNN_INVALID_VALUE_ID;
+        TF_LITE_ENSURE_YNN_STATUS(ynn_define_slice_like(
+            subgraph, /*num_axes=*/1, &mask_seq_axis, mask_to_add_id,
+            logits_id, &sliced_mask_id, /*flags=*/0));
+        mask_to_add_id = sliced_mask_id;
+      }
       TF_LITE_ENSURE_YNN_STATUS(ynn_define_binary(subgraph, ynn_binary_add,
-                                                  logits_id, mask_val_to_add_id,
+                                                  logits_id, mask_to_add_id,
                                                   &masked_logits_id, 0));
     } else {
       masked_logits_id = logits_id;
@@ -452,6 +470,17 @@ TfLiteStatus DefineSdpaNode(TfLiteContext* context, ynn_subgraph_t subgraph,
       const int32_t probs_t_perm[] = {0, 1, 3, 2};
       TF_LITE_ENSURE_YNN_STATUS(ynn_define_static_transpose(
           subgraph, 4, probs_t_perm, probs_id, &probs_t_id, 0));
+
+      if (defer_v_slice) {
+        // Deferred V slice: use the scores as the template so the sliced
+        // extent is the K slice's symbolic extent (see the param block).
+        int32_t slice_axes_v[1] = {v_seq_axis};
+        uint32_t sliced_v_val_id = YNN_INVALID_VALUE_ID;
+        TF_LITE_ENSURE_YNN_STATUS(ynn_define_slice_like(
+            subgraph, /*num_axes=*/1, slice_axes_v, current_v_val_id,
+            scores_id, &sliced_v_val_id, /*flags=*/0));
+        current_v_val_id = sliced_v_val_id;
+      }
 
       uint32_t post_bmm_t_id = YNN_INVALID_VALUE_ID;
       TF_LITE_ENSURE_YNN_STATUS(
@@ -508,8 +537,28 @@ TfLiteStatus DefineSdpaNode(TfLiteContext* context, ynn_subgraph_t subgraph,
 
     uint32_t masked_logits_id = YNN_INVALID_VALUE_ID;
     if (mask_val_to_add_id != YNN_INVALID_VALUE_ID) {
+      uint32_t mask_to_add_id = mask_val_to_add_id;
+      if (sdpa_inputs.param_index != -1) {
+        // Slice the mask along its kv-seq (last) axis using the scores as
+        // the template: the last axis of both maps to the same (innermost)
+        // slinky dim regardless of rank, and the scores' extent there is the
+        // K/V slice's symbolic extent. Reusing that expression (rather than
+        // a separate shape-carrier dummy, whose extent slinky could not
+        // relate to the K/V one) lets loop bounds and steps derived from the
+        // two compare equal at pipeline build time. The elementwise mask
+        // preprocessing above still only computes the consumed region:
+        // bounds are inferred from consumers.
+        const TfLiteTensor& mask_tensor =
+            context->tensors[sdpa_inputs.mask_index];
+        int32_t mask_seq_axis = mask_tensor.dims->size - 1;
+        uint32_t sliced_mask_id = YNN_INVALID_VALUE_ID;
+        TF_LITE_ENSURE_YNN_STATUS(ynn_define_slice_like(
+            subgraph, /*num_axes=*/1, &mask_seq_axis, mask_to_add_id,
+            logits_id, &sliced_mask_id, /*flags=*/0));
+        mask_to_add_id = sliced_mask_id;
+      }
       TF_LITE_ENSURE_YNN_STATUS(ynn_define_binary(subgraph, ynn_binary_add,
-                                                  logits_id, mask_val_to_add_id,
+                                                  logits_id, mask_to_add_id,
                                                   &masked_logits_id, 0));
     } else {
       masked_logits_id = logits_id;
@@ -518,6 +567,20 @@ TfLiteStatus DefineSdpaNode(TfLiteContext* context, ynn_subgraph_t subgraph,
     uint32_t probs_id = YNN_INVALID_VALUE_ID;
     TF_LITE_ENSURE_YNN_STATUS(
         ynn::define_softmax(subgraph, masked_logits_id, 1.0f, probs_id));
+
+    if (defer_v_slice) {
+      // Deferred V slice: use the scores as the template so the sliced
+      // extent is the K slice's symbolic extent (see the param block).
+      int32_t slice_axes_v[1] = {v_seq_axis};
+      uint32_t sliced_v_val_id = YNN_INVALID_VALUE_ID;
+      TF_LITE_ENSURE_YNN_STATUS(ynn_define_slice_like(
+          subgraph, /*num_axes=*/1, slice_axes_v, current_v_val_id, scores_id,
+          &sliced_v_val_id, /*flags=*/0));
+      current_v_val_id = sliced_v_val_id;
+      const int32_t v_perm[] = {0, 1, 3, 2};
+      TF_LITE_ENSURE_YNN_STATUS(ynn_define_static_transpose(
+          subgraph, 4, v_perm, current_v_val_id, &v_trans_id, 0));
+    }
 
     TF_LITE_ENSURE_YNN_STATUS(
         ynn_define_dot(subgraph, /*num_k_dims=*/1, probs_id, v_trans_id,
